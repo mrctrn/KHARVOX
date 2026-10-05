@@ -550,20 +550,29 @@ bool installCrosshairCaptureHook() {
 template <size_t Size, typename Function>
 bool installEntryHook(
     unsigned char* target, const std::array<unsigned char, Size>& signature,
-    const void* hook, Function& original, const char* label) {
+    const void* hook, Function& original, const char* label,
+    size_t patchSize = Size) {
+    // Verification may span more of the prologue than we replay: the caller's
+    // signature can carry RIP-relative operands (security-cookie load) that a
+    // relocated trampoline would compute against the wrong address. Only the
+    // leading, position-independent instructions are copied and re-entered.
+    if (patchSize < 14 || patchSize > Size) {
+        log(std::string(label) + " invalid patch length");
+        return false;
+    }
     auto trampoline = static_cast<unsigned char*>(VirtualAlloc(
-        nullptr, Size + 14, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        nullptr, patchSize + 14, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!trampoline) {
         log(std::string(label) + " trampoline allocation failed");
         return false;
     }
-    std::memcpy(trampoline, target, signature.size());
-    appendAbsoluteJump(trampoline + signature.size(), target + signature.size());
+    std::memcpy(trampoline, target, patchSize);
+    appendAbsoluteJump(trampoline + patchSize, target + patchSize);
     original = reinterpret_cast<Function>(trampoline);
 
     DWORD oldProtect{};
     if (!VirtualProtect(
-            target, signature.size(), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            target, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         original = nullptr;
         VirtualFree(trampoline, 0, MEM_RELEASE);
         log(std::string(label) + " patch protection failed");
@@ -572,11 +581,37 @@ bool installEntryHook(
     std::array<unsigned char, Size> patch{};
     patch.fill(0x90);
     appendAbsoluteJump(patch.data(), hook);
-    std::memcpy(target, patch.data(), patch.size());
-    FlushInstructionCache(GetCurrentProcess(), target, patch.size());
+    std::memcpy(target, patch.data(), patchSize);
+    FlushInstructionCache(GetCurrentProcess(), target, patchSize);
     DWORD ignored{};
-    VirtualProtect(target, signature.size(), oldProtect, &ignored);
+    VirtualProtect(target, patchSize, oldProtect, &ignored);
     return true;
+}
+
+// Unique-match scan of the executable sections. Ambiguity is a failure, never
+// "first match wins" - a lifecycle hook built on a non-unique signature would
+// route a foreign screen through the VR pause state.
+static unsigned char* findUniqueHudEntry(
+    unsigned char* image, const unsigned char* pattern, size_t length) {
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    unsigned char* found = nullptr;
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (unsigned index = 0; index < nt->FileHeader.NumberOfSections;
+         ++index, ++section) {
+        if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        auto begin = image + section->VirtualAddress;
+        const size_t size = section->Misc.VirtualSize;
+        if (size < length) continue;
+        for (size_t offset = 0; offset + length <= size; ++offset) {
+            if (std::memcmp(begin + offset, pattern, length)) continue;
+            if (found) return nullptr;
+            found = begin + offset;
+        }
+    }
+    return found;
 }
 
 using HudCanvasSizeFn=void(__fastcall*)(void*,int,int,float,float);
@@ -1435,28 +1470,62 @@ bool installPauseMenuLifecycleHooks() {
 
     auto showTarget = image + 0x106A8D0;
     auto hideTarget = image + 0x1068DD0;
-    constexpr std::array<unsigned char, 20> showSignature{
+    // Leading position-independent prologue: exactly the bytes the trampoline
+    // replays, kept clear of the RIP-relative security-cookie load that
+    // follows and would compute against the wrong address if relocated.
+    constexpr std::array<unsigned char, 20> showPrefix{
         0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
         0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x70, 0xFF, 0xFF, 0xFF
     };
-    constexpr std::array<unsigned char, 20> hideSignature{
+    constexpr std::array<unsigned char, 20> hidePrefix{
         0x48, 0x8B, 0xC4, 0x57, 0x48, 0x81, 0xEC, 0x00, 0x01, 0x00,
         0x00, 0x48, 0xC7, 0x44, 0x24, 0x20, 0xFE, 0xFF, 0xFF, 0xFF
     };
-    if (std::memcmp(showTarget, showSignature.data(), showSignature.size())
-        || std::memcmp(hideTarget, hideSignature.data(), hideSignature.size())) {
+    // Full prologue, cookie load included. The prefix alone is ambiguous on
+    // shifted builds, and the cookie displacement is what separates the two
+    // near-identical entry points there.
+    constexpr std::array<unsigned char, 64> showSignature{
+        0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
+        0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x70, 0xFF, 0xFF, 0xFF,
+        0x48, 0x81, 0xEC, 0x90, 0x01, 0x00, 0x00, 0x48, 0xC7, 0x44,
+        0x24, 0x40, 0xFE, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x9C, 0x24,
+        0xE0, 0x01, 0x00, 0x00, 0x48, 0x8B, 0x05, 0xED, 0xAF, 0x6D,
+        0x04, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x85, 0x80, 0x00, 0x00,
+        0x00, 0x44, 0x8B, 0xE2
+    };
+    constexpr std::array<unsigned char, 46> hideSignature{
+        0x48, 0x8B, 0xC4, 0x57, 0x48, 0x81, 0xEC, 0x00, 0x01, 0x00,
+        0x00, 0x48, 0xC7, 0x44, 0x24, 0x20, 0xFE, 0xFF, 0xFF, 0xFF,
+        0x48, 0x89, 0x58, 0x18, 0x48, 0x89, 0x70, 0x20, 0x48, 0x8B,
+        0x05, 0xFD, 0xCA, 0x6D, 0x04, 0x48, 0x33, 0xC4, 0x48, 0x89,
+        0x84, 0x24, 0xF0, 0x00, 0x00, 0x00
+    };
+    // Steam layout first - its cookie displacement differs, so the full
+    // signatures would not match there - then a unique scan for shifted builds.
+    if (std::memcmp(showTarget, showPrefix.data(), showPrefix.size())
+        || std::memcmp(hideTarget, hidePrefix.data(), hidePrefix.size())) {
+        showTarget = findUniqueHudEntry(
+            image, showSignature.data(), showSignature.size());
+        hideTarget = findUniqueHudEntry(
+            image, hideSignature.data(), hideSignature.size());
+    }
+    if (!showTarget || !hideTarget) {
         log("idMenuScreen_Shell_Pause lifecycle signature mismatch; Pause QUAD disabled");
         return false;
     }
     if (!installEntryHook(
             showTarget, showSignature,
             reinterpret_cast<const void*>(&pauseScreenShowHook),
-            originalPauseScreenShow, "Pause ShowScreen")) return false;
+            originalPauseScreenShow, "Pause ShowScreen", showPrefix.size())) return false;
     if (!installEntryHook(
             hideTarget, hideSignature,
             reinterpret_cast<const void*>(&pauseScreenHideHook),
-            originalPauseScreenHide, "Pause HideScreen")) return false;
-    log("native Pause lifecycle hooks installed: ShowScreen RVA 0x106A8D0, HideScreen RVA 0x1068DD0");
+            originalPauseScreenHide, "Pause HideScreen", hidePrefix.size())) return false;
+    std::ostringstream installed;
+    installed << "native Pause lifecycle hooks installed: ShowScreen RVA 0x"
+        << std::hex << static_cast<uintptr_t>(showTarget - image)
+        << ", HideScreen RVA 0x" << static_cast<uintptr_t>(hideTarget - image);
+    log(installed.str());
     return true;
 }
 

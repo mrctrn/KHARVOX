@@ -170,6 +170,7 @@ static void enterPhase(Phase next){auto current=state.load();do{if(!canTransitio
 #include "NativeStartupControls.inc"
 #include "NativeAerWorldProducer.inc"
 static bool installEngine(bool visualOnly=false){
+ KharvoxCameraSetAerWorldSourceObserver(false);
  auto base=reinterpret_cast<unsigned char*>(GetModuleHandleW(L"DOOMx64vk.exe"));if(!base)return false;
  auto dos=reinterpret_cast<IMAGE_DOS_HEADER*>(base);if(dos->e_magic!=IMAGE_DOS_SIGNATURE)return false;
  auto nt=reinterpret_cast<IMAGE_NT_HEADERS64*>(base+dos->e_lfanew);
@@ -213,8 +214,10 @@ static bool installEngine(bool visualOnly=false){
  for(void* p:created)if(MH_QueueEnableHook(p)!=MH_OK)fail("engine hook activation could not be staged");
  if(MH_ApplyQueued()!=MH_OK){for(void* p:created){auto disabled=MH_DisableHook(p);if(disabled!=MH_OK&&disabled!=MH_ERROR_DISABLED)fail("engine hook rollback failed");if(MH_RemoveHook(p)!=MH_OK)fail("engine hook removal failed");}return false;}
  nativeCvarModule=reinterpret_cast<uintptr_t>(base);
- if(visualOnly&&realAerBuildViewMatrices)
+ if(visualOnly&&realAerBuildViewMatrices){
+  KharvoxCameraSetAerWorldSourceObserver(true);
   kharvoxnative::log::info("[AER-WORLD-SOURCE] r262 validated read-only producer observer ACTIVE; no camera writes or inline override");
+ }
  nativeCvarSet=realFreshShadowSet?realFreshShadowSet:reinterpret_cast<decltype(nativeCvarSet)>(base+0x295780);
  final_stage_hook_installed=false; // Completion is replayed at the Vulkan pass boundary.
  return true;

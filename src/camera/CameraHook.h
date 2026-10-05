@@ -25,6 +25,8 @@ kharvox::AerWorldViewResult KharvoxCameraRecognizeAerWorldView(const float pose[
 void KharvoxCameraRecordAerWorldSource(const kharvox::AerWorldView& source);
 bool KharvoxCameraUsesAerGameplaySource();
 kharvox::AerSourceObservation KharvoxCameraTakeAerWorldSource();
+void KharvoxCameraSetAerWorldSourceObserver(bool active);
+bool KharvoxCameraAerWorldSourceObserverActive();
 void KharvoxCameraSetCrouchState(bool active);
 void KharvoxCameraSetImmersiveCinematicFov(
     float fovXDegrees, float fovYDegrees,

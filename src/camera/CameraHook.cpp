@@ -756,6 +756,16 @@ void publishHudCenterRenderPose(
     hudRenderPoseSequence.fetch_add(1, std::memory_order_release);
 }
 
+// Caller RVAs of the shared render-camera pipeline. The gameplay cluster
+// (Steam call site 0xE3F8D3 with guards 0xE3F8FC / 0xE3F96A) shifts between
+// builds (GOG call site 0xE3E213); installPlayerPhysicsOriginCapture resolves
+// the site by signature scan and stores the derived values here. The
+// animated/cinematic caller belongs to a different function (Steam 0xA30CFF,
+// GOG 0xA2F73F) and is swapped when a shifted site is detected.
+static std::atomic<uintptr_t> renderCameraAxisGuardRva{0xE3F8FC};
+static std::atomic<uintptr_t> renderCameraGameplayCallerRva{0xE3F96A};
+static std::atomic<uintptr_t> animatedCameraCallerRva{0xA30CFF};
+
 extern "C" const float* __fastcall getVRGameplayViewAxis(void* player) {
     auto original = originalPlayerViewAxis.load(std::memory_order_acquire);
     if (!original) return nullptr;
@@ -771,11 +781,13 @@ extern "C" const float* __fastcall getVRGameplayViewAxis(void* player) {
     const auto imageBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
     const uintptr_t callerRva = imageBase && caller >= imageBase ? caller - imageBase : 0;
-    // The normal gameplay render camera obtains this axis at RVA 0xE3F8F6
-    // (return address 0xE3F8FC). CameraHook composes OpenXR orientation there
-    // after publishing the untouched native body pose. Returning the combined
-    // axis to that one caller would apply HMD orientation twice.
-    if (callerRva == 0xE3F8FC) return nativeAxis;
+    // The normal gameplay render camera obtains this axis at the call whose
+    // return address is the build-specific guard RVA (Steam 0xE3F8FC, GOG
+    // 0xE3E23C). CameraHook composes OpenXR orientation there after publishing
+    // the untouched native body pose. Returning the combined axis to that one
+    // caller would apply HMD orientation twice.
+    if (callerRva == renderCameraAxisGuardRva.load(std::memory_order_relaxed))
+        return nativeAxis;
 
     thread_local std::array<float, 9> combinedAxis{};
     std::memcpy(combinedAxis.data(), nativeAxis, sizeof(combinedAxis));
@@ -841,18 +853,64 @@ extern "C" const float* __fastcall capturePlayerPhysicsOrigin(void* player) {
 }
 
 bool installPlayerPhysicsOriginCapture(unsigned char* image) {
-    constexpr uintptr_t callsiteRva = 0xE3F8D3;
-    auto target = image + callsiteRva;
     constexpr unsigned char signature[] = {
         0x48,0x8B,0x03,
         0x48,0x8B,0xCB,
         0xFF,0x90,0x70,0x03,0x00,0x00,
         0x48,0x8B,0xCB
     };
-    if (std::memcmp(target, signature, sizeof(signature))) {
+    // Locate the gameplay render-camera ViewOrigin call by signature plus
+    // structural context: the paired ViewAxis call (slot 0x368) at +0x23 and
+    // a relative call at +0x92 whose return address (+0x97) is the gameplay
+    // caller RVA. The site shifts between builds (Steam 0xE3F8D3, GOG
+    // 0xE3E213) while unrelated functions repeat the same 15 bytes, so the
+    // context is what distinguishes the real call site.
+    unsigned char* target = nullptr;
+    {
+        auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
+        IMAGE_NT_HEADERS64* nt = nullptr;
+        if (dos && dos->e_magic == IMAGE_DOS_SIGNATURE)
+            nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+        if (nt && nt->Signature == IMAGE_NT_SIGNATURE) {
+            auto section = IMAGE_FIRST_SECTION(nt);
+            for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+                if (std::memcmp(section->Name, ".text", 5)) continue;
+                auto begin = image + section->VirtualAddress;
+                const size_t size = section->Misc.VirtualSize;
+                for (size_t offset = 0; offset + 0x93 <= size; ++offset) {
+                    if (std::memcmp(begin + offset, signature, sizeof(signature))) continue;
+                    constexpr unsigned char viewAxisCall[] = {0xFF,0x90,0x68,0x03,0x00,0x00};
+                    if (std::memcmp(begin + offset + 0x23, viewAxisCall, sizeof(viewAxisCall)))
+                        continue;
+                    if (begin[offset + 0x92] != 0xE8) continue;
+                    target = begin + offset;
+                    break;
+                }
+                if (target) break;
+            }
+        }
+    }
+    if (!target) {
+        // Legacy exact site for builds that carry the original layout.
+        auto legacy = image + 0xE3F8D3;
+        if (!std::memcmp(legacy, signature, sizeof(signature))) target = legacy;
+    }
+    if (!target) {
         log("player physics-origin capture signature mismatch; stable weapon anchor disabled");
         return false;
     }
+
+    const auto siteRva = static_cast<uintptr_t>(target - image);
+    // Guard RVAs stay at a fixed offset from the call site within the same
+    // function (Steam site 0xE3F8D3 -> guard 0xE3F8FC, gameplay caller
+    // 0xE3F96A). A shifted site also implies the animated/cinematic caller
+    // moved with the build; the GOG counterpart of Steam 0xA30CFF is 0xA2F73F.
+    renderCameraAxisGuardRva.store(
+        siteRva + (0xE3F8FC - 0xE3F8D3), std::memory_order_release);
+    renderCameraGameplayCallerRva.store(
+        siteRva + (0xE3F96A - 0xE3F8D3), std::memory_order_release);
+    if (siteRva != 0xE3F8D3)
+        animatedCameraCallerRva.store(0xA2F73F, std::memory_order_release);
 
     auto stub = static_cast<unsigned char*>(VirtualAlloc(
         nullptr, 96, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
@@ -885,7 +943,16 @@ bool installPlayerPhysicsOriginCapture(unsigned char* image) {
     FlushInstructionCache(GetCurrentProcess(), target, sizeof(jump));
     DWORD ignored{};
     VirtualProtect(target, sizeof(jump), oldProtect, &ignored);
-    log("stable idPhysics_Player origin capture installed at gameplay RVA 0xE3F8D3");
+    {
+        std::ostringstream installLog;
+        installLog << "stable idPhysics_Player origin capture installed at gameplay RVA 0x"
+                   << std::hex << siteRva
+                   << " (axis guard 0x" << renderCameraAxisGuardRva.load(std::memory_order_relaxed)
+                   << ", gameplay caller 0x" << renderCameraGameplayCallerRva.load(std::memory_order_relaxed)
+                   << ", animated caller 0x" << animatedCameraCallerRva.load(std::memory_order_relaxed)
+                   << ")";
+        log(installLog.str());
+    }
     return true;
 }
 
@@ -1538,7 +1605,7 @@ extern "C" void __fastcall patchCamera(void* rawContext, void* rawReturnAddress)
     const auto unmodifiedCameraBytes = reinterpret_cast<unsigned char*>(rawContext);
     const auto unmodifiedPosition = reinterpret_cast<float*>(unmodifiedCameraBytes + 0xC0);
     const auto unmodifiedBasis = reinterpret_cast<float*>(unmodifiedCameraBytes + 0xCC);
-    if(callerRva==0xA30CFF&&KharvoxCameraBossSequenceActive()){
+    if(callerRva==animatedCameraCallerRva.load(std::memory_order_relaxed)&&KharvoxCameraBossSequenceActive()){
         cutsceneActive.store(true,std::memory_order_release);
         InterlockedExchange(&immersiveCinematicFovHookActive,0);
         sample.context=context;sample.returnAddress=returnAddress;
@@ -1551,7 +1618,7 @@ extern "C" void __fastcall patchCamera(void* rawContext, void* rawReturnAddress)
     }
     synchronizeAerAnimatedCameraPose(
         callerRva, unmodifiedPosition, unmodifiedBasis);
-    if (callerRva == 0xA30CFF) {
+    if (callerRva == animatedCameraCallerRva.load(std::memory_order_relaxed)) {
         // Glory kills and other cinematics use a different camera basis. They
         // must never overwrite the persistent gameplay body pose. In the
         // optional immersive mode, keep the native animated position but
@@ -1667,7 +1734,8 @@ extern "C" void __fastcall patchCamera(void* rawContext, void* rawReturnAddress)
         InterlockedIncrement64(reinterpret_cast<volatile LONG64*>(&sample.hits));
         return;
     }
-    const bool gameplayCamera = callerRva == 0xE3F96A;
+    const bool gameplayCamera =
+        callerRva == renderCameraGameplayCallerRva.load(std::memory_order_relaxed);
     const bool cinematicEnded = gameplayCamera
         && cutsceneActive.exchange(false, std::memory_order_acq_rel);
     if (cinematicEnded && preCinematicGameplayAxisValid.load(std::memory_order_acquire))
@@ -1993,6 +2061,9 @@ kharvox::AerWorldViewResult KharvoxCameraRecognizeAerWorldView(const float pose[
 }
 void KharvoxCameraRecordAerWorldSource(const kharvox::AerWorldView& source){aerSourceWindow.observe({source.poseId,source.level,source.eye,source.domain});}
 kharvox::AerSourceObservation KharvoxCameraTakeAerWorldSource(){return aerSourceWindow.take();}
+static std::atomic<bool> aerWorldSourceObserverActive{false};
+void KharvoxCameraSetAerWorldSourceObserver(bool active){aerWorldSourceObserverActive.store(active,std::memory_order_release);}
+bool KharvoxCameraAerWorldSourceObserverActive(){return aerWorldSourceObserverActive.load(std::memory_order_acquire);}
 bool KharvoxCameraUsesAerGameplaySource(){
     return aerRenderPairEnabled.load(std::memory_order_acquire)&&!kharvox::native::requested()
         &&KharvoxCameraGameplayActive()&&!KharvoxCameraCutsceneActive()

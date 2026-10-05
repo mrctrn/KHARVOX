@@ -211,19 +211,233 @@ bool synchronizeAerAnimatedWeaponProp(
     uintptr_t entity, const float* nativeOrigin, const float* nativeAxis,
     float synchronizedOrigin[3], float synchronizedAxis[9],bool finalEntity=false);
 
+// Shared idRenderEntity axis-copy site plus the call sites whose return
+// addresses gate setRenderEntityAxisHook. Steam builds carry the fixed RVAs
+// below; shifted builds (GOG) resolve them from signatures during install so
+// a foreign return address can never be mistaken for one of the three callers.
+std::atomic<uintptr_t> weaponAxisCallerRva{0xD7E518};
+std::atomic<uintptr_t> weaponPropCallerRva{0xD8AE66};
+std::atomic<uintptr_t> hudFinalCallerRva{0xF9227F};
+
+// The single idHands call site that is allowed to feed VR identity
+// classification. Steam carries the fixed RVA; shifted builds resolve it from
+// the call site's structural context, and an unidentified caller is stored as
+// 0 so a foreign return address can never be mistaken for it.
+std::atomic<uintptr_t> weaponDataCallerRva{0xD7D6C2};
+
+constexpr unsigned char axisCopySignature[] = {
+    0x0F,0xB6,0x41,0x71,0x84,0x41,0x70,0x75,0x50,
+    0x8B,0x02,0x89,0x81,0xD4,0x00,0x00,0x00};
+// The weapon caller reloads the entity lock mask right after the call; the
+// animated prop caller finishes storing the origin into entity+0x78 first.
+constexpr unsigned char weaponCallerBefore[]{0x48,0x8B,0xCE};
+constexpr unsigned char weaponCallerAfter[]{0x0F,0xB6,0x46,0x71};
+constexpr unsigned char propCallerBefore[]{
+    0xF3,0x41,0x0F,0x11,0x85,0x80,0x00,0x00,0x00};
+constexpr unsigned char propCallerAfter[]{0x8B,0x86,0x40,0x01,0x00,0x00};
+// Weapon-decl flag test that immediately precedes the muzzle fire-axis branch.
+constexpr unsigned char muzzleBranchContext[] = {
+    0x80,0xBF,0x21,0x06,0x00,0x00,0x00,0x0F,0x85,0x6A,0x06,0x00,0x00};
+
+IMAGE_NT_HEADERS64* executableImageNt(unsigned char* image) {
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+    return nt && nt->Signature == IMAGE_NT_SIGNATURE ? nt : nullptr;
+}
+
+// Unique-match scan of the executable sections. Ambiguity is a failure, never
+// "first match wins" — a hook built on a non-unique signature is not
+// trustworthy.
+unsigned char* findUniqueExecutableBytes(
+    unsigned char* image, const unsigned char* pattern, size_t length) {
+    auto nt = executableImageNt(image);
+    if (!nt) return nullptr;
+    unsigned char* found = nullptr;
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (unsigned index = 0; index < nt->FileHeader.NumberOfSections;
+         ++index, ++section) {
+        if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        auto begin = image + section->VirtualAddress;
+        const size_t size = section->Misc.VirtualSize;
+        if (size < length) continue;
+        for (size_t offset = 0; offset + length <= size; ++offset) {
+            if (std::memcmp(begin + offset, pattern, length)) continue;
+            if (found) return nullptr;
+            found = begin + offset;
+        }
+    }
+    return found;
+}
+
+// Locates the axis-copy site: the Steam layout first (unchanged behaviour on
+// Steam), then by signature scan for builds where the site shifted.
+unsigned char* findAxisCopySite(unsigned char* image) {
+    auto legacy = image + 0x3B5400;
+    if (!std::memcmp(legacy, axisCopySignature, sizeof(axisCopySignature)))
+        return legacy;
+    return findUniqueExecutableBytes(
+        image, axisCopySignature, sizeof(axisCopySignature));
+}
+
+// Same for the muzzle fire-axis branch; the surrounding weapon-decl flag test
+// keeps the match unique where the bare jne displacement repeats.
+unsigned char* findMuzzleBranchSite(unsigned char* image) {
+    auto legacy = image + 0xD5EFF3;
+    constexpr unsigned char branch[]{0x0F,0x85,0x6A,0x06,0x00,0x00};
+    if (!std::memcmp(legacy, branch, sizeof(branch))) return legacy;
+    auto context = findUniqueExecutableBytes(
+        image, muzzleBranchContext, sizeof(muzzleBranchContext));
+    return context ? context + 7 : nullptr; // branch follows the cmpb
+}
+
+// Resolves the return addresses that gate setRenderEntityAxisHook by finding
+// call sites to the axis-copy target and matching their structural context.
+// Callers that cannot be identified are stored as 0 (gate disabled), so a
+// shifted build can never route another function's return address into the
+// VR transform path.
+bool resolveAxisCopyCallers(unsigned char* image, unsigned char* target) {
+    const auto targetRva = static_cast<uintptr_t>(target - image);
+    if (targetRva == 0x3B5400) return true; // Steam layout keeps the fixed RVAs
+    auto nt = executableImageNt(image);
+    if (!nt) return false;
+    bool weaponResolved = false;
+    bool propResolved = false;
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (unsigned index = 0; index < nt->FileHeader.NumberOfSections;
+         ++index, ++section) {
+        if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        auto begin = image + section->VirtualAddress;
+        const size_t size = section->Misc.VirtualSize;
+        if (size < 5) continue;
+        for (size_t offset = 0; offset + 5 <= size; ++offset) {
+            if (begin[offset] != 0xE8) continue;
+            int displacement{};
+            std::memcpy(&displacement, begin + offset + 1, sizeof(displacement));
+            const auto siteRva = static_cast<uintptr_t>(
+                section->VirtualAddress + offset);
+            if (static_cast<intptr_t>(siteRva + 5) + displacement
+                    != static_cast<intptr_t>(targetRva))
+                continue;
+            const auto returnRva = siteRva + 5;
+            if (!weaponResolved && offset >= sizeof(weaponCallerBefore)
+                && offset + 5 + sizeof(weaponCallerAfter) <= size
+                && !std::memcmp(begin + offset - sizeof(weaponCallerBefore),
+                    weaponCallerBefore, sizeof(weaponCallerBefore))
+                && !std::memcmp(begin + offset + 5, weaponCallerAfter,
+                    sizeof(weaponCallerAfter))) {
+                weaponAxisCallerRva.store(returnRva, std::memory_order_release);
+                weaponResolved = true;
+                continue;
+            }
+            if (!propResolved && offset >= sizeof(propCallerBefore)
+                && offset + 5 + sizeof(propCallerAfter) <= size
+                && !std::memcmp(begin + offset - sizeof(propCallerBefore),
+                    propCallerBefore, sizeof(propCallerBefore))
+                && !std::memcmp(begin + offset + 5, propCallerAfter,
+                    sizeof(propCallerAfter))) {
+                weaponPropCallerRva.store(returnRva, std::memory_order_release);
+                propResolved = true;
+            }
+        }
+    }
+    if (!weaponResolved) return false;
+    if (!propResolved) weaponPropCallerRva.store(0, std::memory_order_release);
+    hudFinalCallerRva.store(0, std::memory_order_release);
+    return true;
+}
+
+// Active weapon-data getter entry. The first 15 bytes identify the instruction
+// boundary we patch; the tail separates the idHands-facing getter from its
+// look-alikes elsewhere in the executable.
+constexpr unsigned char weaponDataPrefix[] = {
+    0x44,0x8B,0xCA,0x83,0xFA,0xFF,0x75,0x07,
+    0x44,0x8B,0x89,0xD4,0x08,0x00,0x00};
+constexpr unsigned char weaponDataTail[] = {
+    0x4C,0x8B,0x41,0x30,0x49,0x63,0xC1,0x48,0x69,0xD0,0x90,0x01,0x00,0x00,
+    0x48,0x8B,0x84,0x0A,0x98,0x18,0x00,0x00,0x48,0x85,0xC0,0x75,0x16};
+// Every legitimate call site loads fireMode from owner+0x8D4 first, so that
+// alone is ambiguous. Only the idHands site null-checks the returned decl
+// before folding the weapon angles into the render axis, which is what
+// identifies the single caller the VR identity classification may follow.
+constexpr unsigned char weaponDataCallerBefore[] = {0x8B,0x93,0xD4,0x08,0x00,0x00};
+constexpr unsigned char weaponDataCallerAfter[] = {0x48,0x85,0xC0};
+
+// Locates the weapon-data entry: the Steam layout first (unchanged behaviour on
+// Steam), then by a signature scan that must match the whole prologue so the
+// look-alike getters are excluded.
+unsigned char* findWeaponDataSite(unsigned char* image) {
+    auto legacy = image + 0xF137B0;
+    if (!std::memcmp(legacy, weaponDataPrefix, sizeof(weaponDataPrefix)))
+        return legacy;
+    std::array<unsigned char,
+        sizeof(weaponDataPrefix) + sizeof(weaponDataTail)> signature{};
+    std::memcpy(signature.data(), weaponDataPrefix, sizeof(weaponDataPrefix));
+    std::memcpy(signature.data() + sizeof(weaponDataPrefix), weaponDataTail,
+                sizeof(weaponDataTail));
+    return findUniqueExecutableBytes(image, signature.data(), signature.size());
+}
+
+// Resolves the single idHands return address that gates VR identity
+// classification. Ambiguity or absence stores nothing, so the caller can fail
+// closed (gate 0) instead of classifying some other function's decl.
+bool resolveWeaponDataCaller(
+    unsigned char* image, unsigned char* target, uintptr_t& resolvedRva) {
+    const auto targetRva = static_cast<uintptr_t>(target - image);
+    auto nt = executableImageNt(image);
+    if (!nt) return false;
+    uintptr_t found = 0;
+    bool ambiguous = false;
+    auto section = IMAGE_FIRST_SECTION(nt);
+    for (unsigned index = 0; index < nt->FileHeader.NumberOfSections;
+         ++index, ++section) {
+        if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        auto begin = image + section->VirtualAddress;
+        const size_t size = section->Misc.VirtualSize;
+        if (size < 5) continue;
+        for (size_t offset = 0; offset + 5 <= size; ++offset) {
+            if (begin[offset] != 0xE8) continue;
+            int displacement{};
+            std::memcpy(&displacement, begin + offset + 1, sizeof(displacement));
+            const auto siteRva = static_cast<uintptr_t>(
+                section->VirtualAddress + offset);
+            if (static_cast<intptr_t>(siteRva + 5) + displacement
+                    != static_cast<intptr_t>(targetRva))
+                continue;
+            if (offset < sizeof(weaponDataCallerBefore)
+                || offset + 5 + sizeof(weaponDataCallerAfter) > size)
+                continue;
+            if (std::memcmp(begin + offset - sizeof(weaponDataCallerBefore),
+                    weaponDataCallerBefore, sizeof(weaponDataCallerBefore))
+                || std::memcmp(begin + offset + 5, weaponDataCallerAfter,
+                    sizeof(weaponDataCallerAfter)))
+                continue;
+            const auto returnRva = siteRva + 5;
+            if (found && found != returnRva) { ambiguous = true; break; }
+            found = returnRva;
+        }
+        if (ambiguous) break;
+    }
+    if (ambiguous || !found) return false;
+    resolvedRva = found;
+    return true;
+}
+
 bool installMuzzleFireAxisOverride(unsigned char* image) {
     // idHands::FireWeapon normally redirects the muzzle toward the 2D
     // crosshair. The weapon-decl flag useMuzzleAsFireAxis bypasses that path.
     // Preserve the native implementation and only force its existing branch
     // while a valid VR weapon pose is active.
-    auto branch = image + 0xD5EFF3;
-    constexpr unsigned char signature[]{0x0F,0x85,0x6A,0x06,0x00,0x00};
-    if (std::memcmp(branch, signature, sizeof(signature))) {
+    auto branch = findMuzzleBranchSite(image);
+    if (!branch) {
         log("RVA 0xD5EFF3 useMuzzleAsFireAxis branch signature mismatch; VR shot direction disabled");
         return false;
     }
     muzzleFireAxisBranch = branch;
-    log("native idHands useMuzzleAsFireAxis branch armed at RVA 0xD5EFF3");
+    std::ostringstream branchMessage;
+    branchMessage << "native idHands useMuzzleAsFireAxis branch armed at RVA 0x"
+                  << std::hex << static_cast<uintptr_t>(branch - image);
+    log(branchMessage.str());
     return true;
 }
 
@@ -1167,7 +1381,9 @@ extern "C" void* __fastcall activeWeaponDataHook(void* owner, int fireMode) {
     void* result = resolveActiveWeaponDataNative(owner, fireMode);
     const auto image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto returnAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
-    if (image && returnAddress >= image && returnAddress - image == 0xD7D6C2) {
+    const auto callerRva = weaponDataCallerRva.load(std::memory_order_acquire);
+    if (image && callerRva && returnAddress >= image
+        && returnAddress - image == callerRva) {
         if (activeWeaponData.load(std::memory_order_acquire) != reinterpret_cast<uintptr_t>(result))
             prepareReachableVrSniperDecls(owner, result);
         observeActiveWeaponData(owner, result);
@@ -1176,21 +1392,25 @@ extern "C" void* __fastcall activeWeaponDataHook(void* owner, int fireMode) {
 }
 
 bool installActiveWeaponIdentityHook(unsigned char* image) {
-    auto target = image + 0xF137B0;
-    constexpr unsigned char signature[] = {
-        0x44,0x8B,0xCA,0x83,0xFA,0xFF,0x75,0x07,
-        0x44,0x8B,0x89,0xD4,0x08,0x00,0x00
-    };
-    if (std::memcmp(target, signature, sizeof(signature))) {
-        log("RVA 0xF137B0 active weapon-data signature mismatch; two-hand identity stays UNKNOWN/einhändig");
+    auto target = findWeaponDataSite(image);
+    if (!target) {
+        log("active weapon-data signature mismatch; two-hand identity stays UNKNOWN/einhändig");
         return false;
     }
+    const auto siteRva = static_cast<uintptr_t>(target - image);
+    uintptr_t callerRva = 0xD7D6C2;
+    if (siteRva != 0xF137B0 && !resolveWeaponDataCaller(image, target, callerRva)) {
+        weaponDataCallerRva.store(0, std::memory_order_release);
+        log("active weapon-data caller gate unresolved; two-hand identity stays UNKNOWN/einhändig");
+        return false;
+    }
+    constexpr size_t patchSize = sizeof(weaponDataPrefix);
     DWORD oldProtect{};
-    if (!VirtualProtect(target, sizeof(signature), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    if (!VirtualProtect(target, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         log("active weapon-data target protection failed; two-hand identity stays UNKNOWN/einhändig");
         return false;
     }
-    unsigned char jump[sizeof(signature)]{0xFF,0x25,0,0,0,0};
+    unsigned char jump[patchSize]{0xFF,0x25,0,0,0,0};
     const auto wrapper = reinterpret_cast<unsigned long long>(activeWeaponDataHook);
     std::memcpy(jump + 6, &wrapper, sizeof(wrapper));
     jump[14] = 0x90;
@@ -1198,7 +1418,12 @@ bool installActiveWeaponIdentityHook(unsigned char* image) {
     FlushInstructionCache(GetCurrentProcess(), target, sizeof(jump));
     DWORD ignored{};
     VirtualProtect(target, sizeof(jump), oldProtect, &ignored);
-    log("active weapon identity and VR sniper-presentation hook installed at RVA 0xF137B0; decl paths are caller-gated to idHands");
+    weaponDataCallerRva.store(callerRva, std::memory_order_release);
+    std::ostringstream installed;
+    installed << "active weapon identity and VR sniper-presentation hook installed at RVA 0x"
+        << std::hex << siteRva << "; decl paths are caller-gated to idHands at RVA 0x"
+        << callerRva;
+    log(installed.str());
     return true;
 }
 
@@ -2442,9 +2667,13 @@ extern "C" void __fastcall setRenderEntityAxisHook(void* rawEntity, const float*
     const auto returnSlot = static_cast<unsigned char*>(_AddressOfReturnAddress());
     const auto image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto returnAddress = *reinterpret_cast<const uintptr_t*>(returnSlot);
-    const bool weaponCaller = returnAddress - image == 0xD7E518;
-    const bool weaponPropCaller = returnAddress - image == 0xD8AE66;
-    const bool hudFinalCaller = returnAddress - image == 0xF9227F;
+    const auto callerRva = returnAddress - image;
+    const bool weaponCaller =
+        callerRva == weaponAxisCallerRva.load(std::memory_order_relaxed);
+    const bool weaponPropCaller =
+        callerRva == weaponPropCallerRva.load(std::memory_order_relaxed);
+    const bool hudFinalCaller =
+        callerRva == hudFinalCallerRva.load(std::memory_order_relaxed);
     if (weaponCaller || weaponPropCaller)
         updateCustomHandsWeaponDepth(entity, weaponPropCaller);
     const float* axisToCopy = nativeAxis;
@@ -2530,25 +2759,27 @@ bool KharvoxWeaponInstallHook() {
     installWeaponRenderUpdateProbe(image);
     installHandsFovScaleHook(image);
     installMuzzleFireAxisOverride(image);
-    auto target = image + 0x3B5400;
-    constexpr unsigned char signature[] = {
-        0x0F,0xB6,0x41,0x71,0x84,0x41,0x70,0x75,0x50,
-        0x8B,0x02,0x89,0x81,0xD4,0x00,0x00,0x00
-    };
-    if (std::memcmp(target, signature, sizeof(signature))) {
+    auto target = findAxisCopySite(image);
+    if (!target) {
         log("RVA 0x3B5400 axis-copy signature mismatch; final transform hook disabled");
         if (weaponKickOverrideArmed) setWeaponKickSuppressed(false);
         if (hitReactionOverrideArmed) setHandsHitReactionsSuppressed(false);
         return false;
     }
+    if (!resolveAxisCopyCallers(image, target)) {
+        log("axis-copy caller signature mismatch; final transform hook disabled");
+        if (weaponKickOverrideArmed) setWeaponKickSuppressed(false);
+        if (hitReactionOverrideArmed) setHandsHitReactionsSuppressed(false);
+        return false;
+    }
     DWORD oldProtect{};
-    if (!VirtualProtect(target, sizeof(signature), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    if (!VirtualProtect(target, sizeof(axisCopySignature), PAGE_EXECUTE_READWRITE, &oldProtect)) {
         log("axis-copy target protection failed");
         if (weaponKickOverrideArmed) setWeaponKickSuppressed(false);
         if (hitReactionOverrideArmed) setHandsHitReactionsSuppressed(false);
         return false;
     }
-    unsigned char jump[sizeof(signature)]{0xFF,0x25,0,0,0,0};
+    unsigned char jump[sizeof(axisCopySignature)]{0xFF,0x25,0,0,0,0};
     const auto wrapper = reinterpret_cast<unsigned long long>(setRenderEntityAxisHook);
     std::memcpy(jump + 6, &wrapper, sizeof(wrapper));
     for (size_t index = 14; index < sizeof(jump); ++index) jump[index] = 0x90;
@@ -2558,7 +2789,13 @@ bool KharvoxWeaponInstallHook() {
     installed.store(true, std::memory_order_release);
     const auto pivot = configuredWeaponPivotAdjustment();
     std::ostringstream installedMessage;
-    installedMessage << "final idHands origin/axis hook installed at RVA 0x3B5400; caller gated to RVA 0xD7E518"
+    installedMessage << "final idHands origin/axis hook installed at RVA 0x"
+        << std::hex << static_cast<uintptr_t>(target - image)
+        << "; weapon caller gated to RVA 0x"
+        << weaponAxisCallerRva.load(std::memory_order_relaxed)
+        << "; prop caller gated to RVA 0x"
+        << weaponPropCallerRva.load(std::memory_order_relaxed)
+        << std::dec
         << "; animated righthandattach adjustment=" << pivot[0] << ',' << pivot[1] << ',' << pivot[2]
         << " yawOffset=" << currentWeaponYawOffsetDegrees()
         << " rollOffset=" << currentWeaponRollOffsetDegrees()

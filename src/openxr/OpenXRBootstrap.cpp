@@ -4369,7 +4369,8 @@ void KharvoxXRPresent(VkQueue q,const VkPresentInfoKHR*p,bool* consumedPresentWa
     // Cinematics must bind completed producer eyes too. Scheduling the next eye
     // does not identify the image returned by the asynchronous engine.
     const bool aerSourceMode=kharvox::aerUseSourceQualification(steamXrAerPairPath,s.immersiveCinematicActive,
-        s.nativeAdaptiveParticipantGuardActive,KharvoxCameraGameplayActive(),KharvoxCameraCutsceneActive());
+        s.nativeAdaptiveParticipantGuardActive,KharvoxCameraGameplayActive(),KharvoxCameraCutsceneActive())
+        &&KharvoxCameraAerWorldSourceObserverActive();
     if(aerSourceMode!=s.aerSourceModeActive){
         s.aerSourceModeActive=aerSourceMode;
         s.aerSourceCacheValid={};s.aerSourceCacheKeys={};s.aerPublishedSourcePoseId=0;
@@ -5199,7 +5200,20 @@ void KharvoxXRPresent(VkQueue q,const VkPresentInfoKHR*p,bool* consumedPresentWa
         if(s.vk.resetFences(s.device,1,&s.copyFence)==VK_SUCCESS)copyCompletion=s.copyFence;
         else log("[XR-COPY-FENCE] copy fence reset failed; using queueWaitIdle fallback");
     }
-    const bool earlyRelease=kharvox::nativeEarlyXrRelease(earlyReleaseRequested,s.runtimeKind,
+    // The copy command buffer belongs to the graphics-family pool (s.queueFamily,
+    // created at session init). If DOOM presents from a different queue (observed
+    // with a live stream: the compute family), submitting the copy there is invalid
+    // usage and the driver rejects it (VK_ERROR_UNKNOWN / -13), emptying every
+    // subsequent frame. Submit on the XR graphics queue instead and force the
+    // completion wait below so the downstream Present on q cannot race the copy's
+    // image layout transitions.
+    const bool queueMismatch=s.queue&&q!=s.queue;
+    const VkQueue copyQueue=queueMismatch?s.queue:q;
+    if(queueMismatch){static uint64_t redirects{};const uint64_t redirectCount=++redirects;if(redirectCount<=4||redirectCount%600==0)
+        log("[PRESENT] copy queue redirect present="+std::to_string(reinterpret_cast<uintptr_t>(q))
+            +" xr="+std::to_string(reinterpret_cast<uintptr_t>(s.queue))
+            +" thread="+std::to_string(GetCurrentThreadId())+" count="+std::to_string(redirectCount));}
+    const bool earlyRelease=!queueMismatch&&kharvox::nativeEarlyXrRelease(earlyReleaseRequested,s.runtimeKind,
         nativePairReady,!s.quadMode,copyCompletion!=VK_NULL_HANDLE,queueSynchronized,readbackRecorded);
     kharvox::NativeXrCopyLifetime copyLifetime(earlyRelease);
     LARGE_INTEGER nativeSubmitAt{},nativeSubmitDone{},nativeReleaseAt{},nativeReleaseDone{},nativeEndAt{},nativeEndDone{},nativeCompleteAt{};
@@ -5217,7 +5231,7 @@ void KharvoxXRPresent(VkQueue q,const VkPresentInfoKHR*p,bool* consumedPresentWa
         kharvox::native::cpu::elapsed(kharvox::native::cpu::XrQueueLock,nativeQueueLockStart);
         kharvox::native::cpu::Scope nativeCopyProfile(kharvox::native::cpu::XrCopyCompletion);
         if(nativeFrameValid)QueryPerformanceCounter(&nativeSubmitAt);
-        {kharvox::native::cpu::Scope submitProfile(kharvox::native::cpu::XrQueueSubmit);kharvox::native::trace::SubmitScope capture("owner-submit",q,1,&submit,copyCompletion);submitResult=s.vk.queueSubmit(q,1,&submit,copyCompletion);capture.result(submitResult);}
+        {kharvox::native::cpu::Scope submitProfile(kharvox::native::cpu::XrQueueSubmit);kharvox::native::trace::SubmitScope capture("owner-submit",copyQueue,1,&submit,copyCompletion);submitResult=s.vk.queueSubmit(copyQueue,1,&submit,copyCompletion);capture.result(submitResult);}
         if(nativeFrameValid)QueryPerformanceCounter(&nativeSubmitDone);
         copyLifetime.submitted(submitResult==VK_SUCCESS);
         if(submitResult==VK_SUCCESS&&consumedPresentWaits)*consumedPresentWaits=true;
@@ -5225,7 +5239,7 @@ void KharvoxXRPresent(VkQueue q,const VkPresentInfoKHR*p,bool* consumedPresentWa
             kharvox::native::cpu::Scope waitProfile(kharvox::native::cpu::XrQueueWait);
             completionResult=copyCompletion
                 ?s.vk.waitForFences(s.device,1,&copyCompletion,VK_TRUE,UINT64_MAX)
-                :s.vk.queueWaitIdle(q);
+                :s.vk.queueWaitIdle(copyQueue);
         }
     }
     auto reportNativeDeviceLost=[&](const char* operation,VkResult failure){
